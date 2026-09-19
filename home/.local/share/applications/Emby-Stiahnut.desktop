@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=Emby Download
+Comment=Stiahnut film z Emby na offline pozeranie
+Exec=/home/bady/.local/bin/emby-dl-window
+Terminal=false
+Type=Application
+Icon=emby-dl
+StartupNotify=false

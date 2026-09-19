@@ -1,0 +1,708 @@
+#!/bin/bash
+
+# Download movies and series from the Emby server for offline viewing.
+#
+# Login: the first time you can save it to the system keyring (encrypted by
+# gnome-keyring, never written to a file); after that it logs in by itself.
+# `emby-dl --login` asks again, `emby-dl --forget` deletes the saved login.
+#
+# Search, pick films or series with fzf (Tab = select several, the right pane shows size, length,
+# formats and a download-time estimate). For a series choose the whole show,
+# whole seasons or single episodes. Everything picked goes into a "cart"; when
+# you finish searching (empty search) you see the total size, time estimate and
+# free disk space, and can change the speed limit before starting.
+#
+# Files go to ~/Videos/Emby:  films as "Name (Year).ext", series as
+# "Series/Season 01/Series - S01E02 - Title.ext". Finished files are skipped and
+# interrupted ones resume.
+#
+# Subtitles that are separate files on the server are downloaded too, next to the
+# video ("Name (Year).cze.srt"), so players such as mpv find them automatically.
+# For a series you already have, "Len chýbajúce epizódy" adds only what is missing
+# (new episodes).
+#
+# Server: the address is read from ~/.config/emby-dl/server (asked once on the first
+# run and saved there, so it is not part of any backup of this script).
+#
+# Env: EMBY_SERVER (overrides the saved address), EMBY_DEST (default ~/Videos/Emby),
+#      EMBY_LIMIT  max download speed, e.g. 4M (default 0 = unlimited). It can also be
+#                  changed in the cart screen before each download.
+
+set -uo pipefail
+
+case ${1:-} in
+-h | --help)
+  sed -n '3,/^set -uo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+  exit 0
+  ;;
+esac
+
+SERVER_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/emby-dl/server"
+DEST=${EMBY_DEST:-$HOME/Videos/Emby}
+AUTH='MediaBrowser Client="emby-dl", Device="omarchy", DeviceId="emby-dl-omarchy", Version="2.0"'
+
+die() {
+  echo "Chyba: $*" >&2
+  exit 1
+}
+
+SERVER=${EMBY_SERVER:-$(cat "$SERVER_FILE" 2>/dev/null)}
+if [[ -z $SERVER ]]; then
+  [[ -t 0 ]] || die "chýba adresa servera (nastav EMBY_SERVER alebo spusti skript v termináli)"
+  read -rp "Adresa Emby servera (napr. https://emby.example.com): " SERVER
+  [[ $SERVER == http://* || $SERVER == https://* ]] || die "adresa musí začínať http:// alebo https://"
+  mkdir -p "$(dirname "$SERVER_FILE")"
+  printf '%s\n' "$SERVER" >"$SERVER_FILE"
+  echo "Adresa uložená do $SERVER_FILE"
+fi
+SERVER=${SERVER%/}
+
+for cmd in curl jq fzf awk; do
+  command -v "$cmd" >/dev/null || die "chýba program '$cmd'"
+done
+
+# ---------------------------------------------------------------- formatting
+
+to_bytes() { # 8M / 500K / 2G / 1234 -> bytes
+  awk -v v="$1" 'BEGIN {
+    u = substr(v, length(v)); n = v + 0
+    if (u == "K" || u == "k") n *= 1024
+    else if (u == "M" || u == "m") n *= 1048576
+    else if (u == "G" || u == "g") n *= 1073741824
+    printf "%d", n }'
+}
+
+hbytes() {
+  awk -v b="$1" 'BEGIN {
+    if (b >= 1073741824) printf "%.1f GB", b / 1073741824
+    else if (b >= 1048576) printf "%.0f MB", b / 1048576
+    else printf "%.0f KB", b / 1024 }'
+}
+
+htime() {
+  awk -v s="$1" 'BEGIN {
+    s = int(s)
+    if (s < 60) printf "%d s", s
+    else if (s < 3600) printf "%d min %02d s", s / 60, s % 60
+    else printf "%d h %02d min", s / 3600, (s % 3600) / 60 }'
+}
+
+LIMIT_BYTES=$(to_bytes "${EMBY_LIMIT:-0}")
+
+limit_text() {
+  if ((LIMIT_BYTES > 0)); then echo "$(hbytes "$LIMIT_BYTES")/s"; else echo "bez limitu"; fi
+}
+
+# Speed used for time estimates: the limit if there is one, otherwise the speed
+# measured during the last unlimited download (0 = unknown).
+SPEED_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/emby-dl/last-speed"
+
+est_speed() {
+  if ((LIMIT_BYTES > 0)); then
+    echo "$LIMIT_BYTES"
+  else
+    local s
+    s=$(cat "$SPEED_FILE" 2>/dev/null)
+    echo "${s:-0}"
+  fi
+}
+
+# Shared jq helpers. Needs --argjson lim <bytes per second, 0 = unknown>.
+read -r -d '' JQ_LIB <<'EOF'
+def hb: if . >= 1073741824 then ((. / 1073741824 * 10 | round) / 10 | tostring) + " GB"
+        elif . >= 1048576 then (. / 1048576 | round | tostring) + " MB"
+        else (. / 1024 | round | tostring) + " KB" end;
+def ht: if . < 60 then "\(. | floor) s"
+        elif . < 3600 then "\((. / 60) | floor) min"
+        else "\((. / 3600) | floor) h \(((. / 60) % 60) | floor) min" end;
+def pad: tostring | if length < 2 then "0" + . else . end;
+def san: gsub("[/\\\\:*?\"<>|]"; "_") | gsub("^\\s+|\\s+$"; "") | gsub("^\\.+$"; "_");
+def ext: (.MediaSources[0].Container // "mkv") | split(",")[0] | san;
+def extsubs: [(.MediaSources[0].MediaStreams // [])[]
+              | select(.Type == "Subtitle" and (.IsExternal // false))
+              | {i: .Index, l: (.Language // "und"), c: ((.Codec // "srt") | ascii_downcase), f: (.IsForced // false)}];
+def title: .Name + (if .ProductionYear then " (\(.ProductionYear))" else "" end);
+def epcode: "S\((.ParentIndexNumber // 0) | pad)E\((.IndexNumber // 0) | pad)";
+def rel:
+  if .Type == "Episode" then
+    ((.SeriesName // "?") | san) + "/Season " + ((.ParentIndexNumber // 0) | pad) + "/"
+    + ((.SeriesName // "?") | san) + " - " + epcode + " - " + (.Name | san) + "." + ext
+  else (title | san) + "." + ext end;
+def preview:
+  (.MediaSources[0] // {}) as $m
+  | ($m.Size // 0) as $sz
+  | ($m.MediaStreams // []) as $st
+  | ($st | map(select(.Type == "Video")) | .[0]) as $v
+  | if .Type == "Series" then
+      [ title, "", "Seriál", (if .ChildCount then "Sérií: \(.ChildCount)" else empty end),
+        (if .RecursiveItemCount then "Epizód: \(.RecursiveItemCount)" else empty end),
+        "", "Po výbere si zvolíš: celý seriál, celé série alebo jednotlivé epizódy.",
+        "", ((.Overview // "") | .[0:400]) ] | join("\n")
+    else
+      [ (if .Type == "Episode" then "\(.SeriesName // "?") \(epcode) - \(.Name)" else title end),
+        "",
+        "Veľkosť:    " + ($sz | hb),
+        "Dĺžka:      " + (((.RunTimeTicks // 0) / 10000000) | ht),
+        "Formát:     " + (($m.Container // "?") | split(",")[0])
+          + (if $v then " · \($v.Width // "?" | tostring)x\($v.Height // "?" | tostring) · \($v.Codec // "?")" else "" end),
+        "Zvuk:       " + ($st | map(select(.Type == "Audio")) | map((.Language // "?") + " " + (.Codec // "")) | join(", ")),
+        "Titulky:    " + ($st | map(select(.Type == "Subtitle")) | map(.Language // "?") | unique | join(", "))
+          + (extsubs | length | if . > 0 then "  (externých súborov: \(.), stiahnu sa spolu s videom)" else "" end),
+        "Sťahovanie: " + (if $lim > 0 and $sz > 0 then "~" + (($sz / $lim) | ht) + " pri " + ($lim | hb) + "/s"
+                          else "závisí od rýchlosti siete" end),
+        (if (.MediaSources | length) > 1 then "Verzií súboru: \(.MediaSources | length) (stiahne sa prvá)" else empty end)
+      ] | join("\n")
+    end;
+EOF
+
+# ---------------------------------------------------------------- API + login
+
+# The token goes through a curl config on a pipe so it never shows up in `ps`.
+api() {
+  curl -sS --max-time 30 -K <(printf 'header = "X-Emby-Token: %s"\n' "$token") "$@"
+}
+
+TMP=$(mktemp -d)
+CURL_PID=
+
+cleanup() {
+  api -X POST "$SERVER/emby/Sessions/Logout" >/dev/null 2>&1
+  rm -rf "$TMP"
+}
+
+on_interrupt() {
+  [[ -n $CURL_PID ]] && kill "$CURL_PID" 2>/dev/null
+  echo
+  echo "Prerušené. Rozpracované súbory dokončíš tým, že skript spustíš znova."
+  exit 130
+}
+
+# ---- login (optionally remembered in the system keyring)
+
+HAVE_KEYRING=false
+command -v secret-tool >/dev/null && HAVE_KEYRING=true
+
+keyring_lookup() { secret-tool lookup service emby-dl server "$SERVER" 2>/dev/null; }
+keyring_forget() { secret-tool clear service emby-dl server "$SERVER" 2>/dev/null; }
+keyring_save() { # user, password
+  jq -nc --arg u "$1" --arg p "$2" '{user: $u, pass: $p}' |
+    secret-tool store --label="Emby ($SERVER)" service emby-dl server "$SERVER"
+}
+
+# authenticate <user> <password>  -> sets $code and $body
+authenticate() {
+  local response
+  response=$(jq -n --arg u "$1" --arg p "$2" '{Username: $u, Pw: $p}' |
+    curl -sS --max-time 60 -w '\n%{http_code}' \
+      -H "Content-Type: application/json" -H "X-Emby-Authorization: $AUTH" \
+      --data @- "$SERVER/emby/Users/AuthenticateByName")
+  code=${response##*$'\n'}
+  body=${response%$'\n'*}
+}
+
+prompt_login() {
+  read -rp "Používateľ: " user
+  read -rsp "Heslo: " pass
+  echo
+}
+
+check_login_result() {
+  if [[ $code == 000 ]]; then
+    die "server neodpovedal do 60 s (pri zlom mene alebo hesle odpovedá veľmi pomaly)"
+  fi
+  [[ $code == 200 ]] || die "prihlásenie zlyhalo (HTTP $code)"
+}
+
+case ${1:-} in
+--forget)
+  keyring_forget
+  echo "Uložené prihlásenie bolo zmazané."
+  exit 0
+  ;;
+esac
+
+user=
+pass=
+saved=false
+code=
+body=
+
+if [[ ${1:-} != --login ]] && $HAVE_KEYRING; then
+  creds=$(keyring_lookup)
+  if [[ -n $creds ]]; then
+    user=$(jq -r '.user // empty' <<<"$creds")
+    pass=$(jq -r '.pass // empty' <<<"$creds")
+    if [[ -n $user && -n $pass ]]; then
+      echo "Prihlasujem ako $user (uložené prihlásenie; zmena účtu: emby-dl --login)..."
+      authenticate "$user" "$pass"
+      if [[ $code == 200 ]]; then
+        saved=true
+      else
+        echo "Uložené prihlásenie nefunguje (HTTP $code; 000 = server neodpovedal alebo heslo už neplatí), zadaj ho znova." >&2
+        code=
+      fi
+    fi
+  fi
+fi
+
+if [[ $code != 200 ]]; then
+  prompt_login
+  authenticate "$user" "$pass"
+  check_login_result
+  if $HAVE_KEYRING; then
+    read -rp "Uložiť prihlásenie do kľúčenky, aby si ho nemusel zadávať znova? [a/N]: " answer
+    if [[ $answer == [aAyY]* ]]; then
+      if keyring_save "$user" "$pass"; then
+        echo "Uložené. Zmazať ho môžeš cez: emby-dl --forget"
+      else
+        echo "Uloženie do kľúčenky zlyhalo." >&2
+      fi
+    fi
+  else
+    echo "Poznámka: chýba 'secret-tool' (balík libsecret), prihlásenie sa uložiť nedá." >&2
+  fi
+fi
+unset pass creds
+
+token=$(jq -r '.AccessToken' <<<"$body")
+uid=$(jq -r '.User.Id' <<<"$body")
+trap cleanup EXIT
+trap on_interrupt INT
+
+if [[ $(jq -r '.User.Policy.EnableContentDownloading // false' <<<"$body") != true ]]; then
+  echo "Upozornenie: server tvoj účet nemá označený na sťahovanie, môže to zlyhať." >&2
+fi
+
+mkdir -p "$DEST"
+
+# ---------------------------------------------------------------- cart
+
+declare -A Q_SEEN=()
+Q_ID=()
+Q_SIZE=()
+Q_REL=()
+Q_MSID=() # media source id, needed for subtitle URLs
+Q_SUBS=() # external subtitle streams as compact JSON
+
+# queue_add <items-json> <newline separated ids>
+queue_add() {
+  local json=$1 ids=$2 id size rel msid subs
+  while IFS=$'\t' read -r id size rel msid subs; do
+    [[ -n $id && -z ${Q_SEEN[$id]:-} ]] || continue
+    Q_SEEN[$id]=1
+    Q_ID+=("$id")
+    Q_SIZE+=("$size")
+    Q_REL+=("$rel")
+    Q_MSID+=("$msid")
+    Q_SUBS+=("$subs")
+  done < <(jq -r --argjson lim "$(est_speed)" --argjson ids "$(jq -R . <<<"$ids" | jq -s .)" \
+    "$JQ_LIB"' .Items[] | select(.Id as $i | $ids | index($i))
+      | [.Id, (.MediaSources[0].Size // 0), rel, (.MediaSources[0].Id // "-"), (extsubs | tojson)] | @tsv' <<<"$json")
+}
+
+# Write a preview text file per item so fzf can show it on the right.
+make_previews() {
+  local id text
+  jq -r --argjson lim "$(est_speed)" "$JQ_LIB"' .Items[] | [.Id, preview] | @tsv' <<<"$1" |
+    while IFS=$'\t' read -r id text; do
+      printf '%b' "$text" >"$TMP/$id.txt"
+    done
+}
+
+FZF_PREVIEW=(--preview "cat '$TMP'/{1}.txt 2>/dev/null" --preview-window=right:50%:wrap)
+
+# Ask about a series and add episodes to the cart.
+series_menu() {
+  local sid=$1 sname=$2 eps mode picked ids count size
+
+  eps=$(api -G "$SERVER/emby/Users/$uid/Items" \
+    --data-urlencode "ParentId=$sid" --data-urlencode "Recursive=true" \
+    --data-urlencode "IncludeItemTypes=Episode" \
+    --data-urlencode "Fields=MediaSources,ProductionYear" --data-urlencode "Limit=5000" |
+    jq '.Items |= (map(select((.MediaSources | length) > 0 and (.LocationType // "FileSystem") != "Virtual"))
+        | sort_by([(.ParentIndexNumber // 0), (.IndexNumber // 0)]))')
+
+  count=$(jq '.Items | length' <<<"$eps")
+  if [[ $count == 0 || -z $count ]]; then
+    echo "Seriál '$sname' nemá žiadne stiahnuteľné epizódy."
+    return
+  fi
+  size=$(jq '[.Items[].MediaSources[0].Size // 0] | add' <<<"$eps")
+
+  # Episodes whose file is not complete on disk yet (new episodes, or never downloaded).
+  local missing_ids missing_n missing_size menu note=""
+  missing_ids=$(jq -r --argjson lim 0 "$JQ_LIB"' .Items[] | [.Id, (.MediaSources[0].Size // 0), rel] | @tsv' <<<"$eps" |
+    while IFS=$'\t' read -r id sz rel; do
+      have=$(stat -c %s "$DEST/$rel" 2>/dev/null || echo 0)
+      ((sz > 0 && have >= sz)) || echo "$id"
+    done)
+  missing_n=0
+  missing_size=0
+  if [[ -n $missing_ids ]]; then
+    missing_n=$(grep -c . <<<"$missing_ids")
+    missing_size=$(jq --argjson ids "$(jq -R . <<<"$missing_ids" | jq -s .)" \
+      '[.Items[] | select(.Id as $i | $ids | index($i)) | .MediaSources[0].Size // 0] | add // 0' <<<"$eps")
+  fi
+
+  menu=""
+  if ((missing_n > 0 && missing_n < count)); then
+    menu+="new"$'\t'"Len chýbajúce epizódy  ($missing_n z $count, $(hbytes "$missing_size"))"$'\n'
+  fi
+  ((missing_n == 0)) && note="  – všetko už máš stiahnuté"
+  menu+="all"$'\t'"Celý seriál  ($count epizód, $(hbytes "$size"))$note"$'\n'
+  menu+="seasons"$'\t'"Vybrať jednu alebo viac sérií"$'\n'
+  menu+="episodes"$'\t'"Vybrať jednotlivé epizódy"$'\n'
+
+  mode=$(printf '%s' "$menu" |
+    fzf --delimiter=$'\t' --with-nth=2 --prompt="$sname> " --header="Čo chceš stiahnuť? (Esc = späť)" | cut -f1)
+
+  case $mode in
+  new)
+    queue_add "$eps" "$missing_ids"
+    ;;
+  all)
+    queue_add "$eps" "$(jq -r '.Items[].Id' <<<"$eps")"
+    ;;
+  seasons)
+    picked=$(jq -r --argjson lim "$(est_speed)" "$JQ_LIB"'
+        .Items | group_by(.ParentIndexNumber // 0)[]
+        | [ (.[0].ParentIndexNumber // 0 | tostring),
+            (if (.[0].ParentIndexNumber // 0) == 0 then "Špeciály" else "Séria \(.[0].ParentIndexNumber)" end)
+              + "  ·  \(length) epizód  ·  " + ([.[].MediaSources[0].Size // 0] | add | hb) ] | @tsv' <<<"$eps" |
+      fzf -m --delimiter=$'\t' --with-nth=2 --prompt="$sname> " \
+        --header="Tab = označiť viac sérií, Enter = pridať do košíka" | cut -f1)
+    [[ -z $picked ]] && return
+    ids=$(jq -r --argjson s "$(jq -R 'tonumber' <<<"$picked" | jq -s .)" \
+      '.Items[] | select((.ParentIndexNumber // 0) as $n | $s | index($n)) | .Id' <<<"$eps")
+    queue_add "$eps" "$ids"
+    ;;
+  episodes)
+    make_previews "$eps"
+    picked=$(jq -r --argjson lim "$(est_speed)" "$JQ_LIB"'
+        .Items[] | [.Id, epcode + "  " + .Name + "  ·  " + ((.MediaSources[0].Size // 0) | hb)] | @tsv' <<<"$eps" |
+      fzf -m --delimiter=$'\t' --with-nth=2 --prompt="$sname> " "${FZF_PREVIEW[@]}" \
+        --header="Tab = označiť viac epizód, Enter = pridať do košíka" | cut -f1)
+    [[ -z $picked ]] && return
+    queue_add "$eps" "$picked"
+    ;;
+  esac
+}
+
+# ---------------------------------------------------------------- download
+
+# Redraws one progress line. Args: cur size speed idx total rest_after
+progress_line() {
+  awk -v cur="$1" -v size="$2" -v sp="$3" -v idx="$4" -v tot="$5" -v rest="$6" -v cols="$(tput cols 2>/dev/null || echo 100)" '
+    function hb(b) { return b >= 1073741824 ? sprintf("%.1f GB", b / 1073741824) : b >= 1048576 ? sprintf("%.0f MB", b / 1048576) : sprintf("%.0f KB", b / 1024) }
+    function ht(s) { s = int(s); return s < 60 ? sprintf("%d s", s) : s < 3600 ? sprintf("%d min %02d s", s / 60, s % 60) : sprintf("%d h %02d min", s / 3600, (s % 3600) / 60) }
+    BEGIN {
+      w = 20
+      if (size > 0) {
+        p = cur * 100 / size; if (p > 100) p = 100
+        f = int(w * p / 100); bar = ""
+        for (i = 0; i < w; i++) bar = bar (i < f ? "█" : "░")
+        left = (sp > 0) ? ht((size - cur) / sp) : "…"
+        all = (sp > 0) ? ht((size - cur + rest) / sp) : "…"
+        line = sprintf("[%d/%d] %s %3.0f%%  %s / %s  %s/s  zostáva %s", idx, tot, bar, p, hb(cur), hb(size), hb(sp), left)
+        if (tot > 1 && cols >= 105) line = line "  ·  spolu " all
+      } else {
+        line = sprintf("[%d/%d] stiahnuté %s  %s/s", idx, tot, hb(cur), hb(sp))
+      }
+      printf "%s", line }'
+}
+
+# fetch_subs <item id> <relpath of the video> <media source id> <subs json>
+# Downloads the subtitle files that live next to the video on the server (subtitles
+# inside the mkv come with the video). They are saved as "<video name>.<lang>.<ext>",
+# which is what mpv and most players pick up automatically.
+fetch_subs() {
+  local id=$1 rel=$2 msid=$3 subs=$4
+  local base="$DEST/${rel%.*}" i lang codec forced ext out got=0 have_already=0
+  local -A used=()
+
+  [[ $msid == - || -z $subs || $subs == "[]" ]] && return 0
+
+  while IFS=$'\t' read -r i lang codec forced; do
+    case $codec in
+    subrip | srt) ext=srt ;;
+    ass | ssa) ext=ass ;;
+    vtt | webvtt) ext=vtt ;;
+    *) ext=srt ;;
+    esac
+    lang=$(tr -cd 'A-Za-z0-9_-' <<<"$lang")
+    out="$base.${lang:-und}"
+    [[ $forced == true ]] && out+=".forced"
+    [[ -n ${used[$out]:-} ]] && out+=".$i" # same language twice
+    used[$out]=1
+    out+=".$ext"
+
+    if [[ -s $out ]]; then
+      have_already=$((have_already + 1))
+      continue
+    fi
+    if api -fL -o "$out.part" "$SERVER/emby/Videos/$id/$msid/Subtitles/$i/Stream.$ext" && [[ -s $out.part ]]; then
+      mv "$out.part" "$out"
+      got=$((got + 1))
+    else
+      rm -f "$out.part"
+      echo "  Titulky sa nepodarilo stiahnuť: ${out##*/}" >&2
+    fi
+  done < <(jq -r '.[] | [.i, .l, .c, .f] | @tsv' <<<"$subs")
+
+  if ((got > 0)); then
+    echo "  + titulky: stiahnutých $got súborov$( ((have_already > 0)) && echo " (ďalších $have_already už máš)")"
+  fi
+  return 0
+}
+
+# download_one <id> <relpath> <size> <index> <total> <bytes remaining after this file> <media source id> <subs json>
+download_one() {
+  local id=$1 rel=$2 size=$3 idx=$4 total=$5 rest=$6 msid=${7:--} subs=${8:-[]}
+  local file="$DEST/$rel" have cur prev sp inst attempt rc errfile="$TMP/curl.err"
+
+  mkdir -p "$(dirname "$file")"
+  have=$(stat -c %s "$file" 2>/dev/null || echo 0)
+
+  if ((size > 0 && have == size)); then
+    echo "[$idx/$total] Už stiahnuté, preskakujem: $rel"
+    fetch_subs "$id" "$rel" "$msid" "$subs"
+    return 0
+  fi
+  if ((size > 0 && have > size)); then
+    rm -f "$file"
+  fi
+
+  echo "[$idx/$total] $rel"
+
+  local t0=$SECONDS
+  for attempt in 1 2 3; do
+    : >"$errfile"
+    curl -sS -fL -C - \
+      --limit-rate "$LIMIT_BYTES" --speed-limit 1024 --speed-time 60 \
+      -H "Accept-Encoding: identity" \
+      -K <(printf 'header = "X-Emby-Token: %s"\n' "$token") \
+      -o "$file" "$SERVER/emby/Items/$id/Download" 2>"$errfile" &
+    CURL_PID=$!
+
+    prev=$(stat -c %s "$file" 2>/dev/null || echo 0)
+    sp=0
+    while kill -0 "$CURL_PID" 2>/dev/null; do
+      sleep 1
+      cur=$(stat -c %s "$file" 2>/dev/null || echo 0)
+      inst=$((cur - prev))
+      prev=$cur
+      sp=$(awk -v sp="$sp" -v i="$inst" 'BEGIN { printf "%d", (sp == 0) ? i : 0.8 * sp + 0.2 * i }')
+      printf '\r\033[K%s' "$(progress_line "$cur" "$size" "$sp" "$idx" "$total" "$rest")"
+    done
+    wait "$CURL_PID"
+    rc=$?
+    CURL_PID=
+    printf '\r\033[K'
+
+    ((rc == 0)) && break
+    if ((rc == 22)); then
+      echo "Server odmietol sťahovanie (asi ho tvoj účet nemá povolené)." >&2
+      [[ -s $file ]] || rm -f "$file"
+      return 1
+    fi
+    if ((rc == 33)); then # server does not support resuming
+      rm -f "$file"
+    fi
+    echo "Prerušené spojenie ($(head -c 120 "$errfile" | tr '\n' ' ')), skúšam znova ($attempt/3)..." >&2
+    sleep 5
+  done
+
+  if ((rc != 0)); then
+    echo "Zlyhalo: $rel" >&2
+    return 1
+  fi
+
+  cur=$(stat -c %s "$file" 2>/dev/null || echo 0)
+  if ((size > 0 && cur != size)); then
+    echo "Upozornenie: veľkosť nesedí ($(hbytes "$cur") namiesto $(hbytes "$size")): $rel" >&2
+    return 1
+  fi
+  # Remember the real network speed (unlimited runs only) for later estimates.
+  if ((LIMIT_BYTES == 0 && SECONDS - t0 >= 3 && cur - have >= 5242880)); then
+    mkdir -p "$(dirname "$SPEED_FILE")"
+    echo $(((cur - have) / (SECONDS - t0))) >"$SPEED_FILE"
+  fi
+  echo "Hotovo: $rel  ($(hbytes "$cur"))"
+  fetch_subs "$id" "$rel" "$msid" "$subs"
+}
+
+# Show the cart, let the user change the limit, then download everything.
+checkout() {
+  local n=${#Q_ID[@]} i have total_size=0 remaining=0 done_count=0 answer avail est
+  local -a Q_REM=()
+
+  while true; do
+    total_size=0
+    remaining=0
+    done_count=0
+    Q_REM=()
+    for ((i = 0; i < n; i++)); do
+      have=$(stat -c %s "$DEST/${Q_REL[$i]}" 2>/dev/null || echo 0)
+      total_size=$((total_size + Q_SIZE[i]))
+      if ((Q_SIZE[i] > 0 && have >= Q_SIZE[i])); then
+        Q_REM+=(0)
+        done_count=$((done_count + 1))
+      else
+        Q_REM+=($((Q_SIZE[i] - have)))
+        remaining=$((remaining + Q_SIZE[i] - have))
+      fi
+    done
+    avail=$(df -B1 --output=avail "$DEST" 2>/dev/null | tail -1 | tr -d ' ')
+
+    clear
+    echo "═══ Košík: $n súborov ═══"
+    for ((i = 0; i < n && i < 15; i++)); do
+      printf '  %-70.70s %10s%s\n' "${Q_REL[$i]}" "$(hbytes "${Q_SIZE[$i]}")" \
+        "$([[ ${Q_REM[$i]} == 0 ]] && echo '  (hotové)')"
+    done
+    ((n > 15)) && echo "  ... a ďalších $((n - 15))"
+    echo
+    echo "Spolu:              $(hbytes "$total_size")"
+    ((done_count > 0)) && echo "Už stiahnuté:       $done_count súborov (preskočia sa)"
+    echo "Treba stiahnuť:     $(hbytes "$remaining")"
+    echo "Limit rýchlosti:    $(limit_text)"
+    est=$(est_speed)
+    if ((LIMIT_BYTES > 0)); then
+      echo "Odhad času:         ~$(htime $((remaining / LIMIT_BYTES))) pri limite $(limit_text)"
+    elif ((est > 0)); then
+      echo "Odhad času:         ~$(htime $((remaining / est))) podľa poslednej nameranej rýchlosti $(hbytes "$est")/s (bez limitu)"
+    else
+      echo "Odhad času:         zatiaľ neznámy (bez limitu; po prvom sťahovaní sa zmeria rýchlosť)"
+    fi
+    if [[ -n $avail ]]; then
+      echo "Voľné miesto:       $(hbytes "$avail") v $DEST"
+      if ((remaining > avail)); then
+        echo "!!! Nedostatok miesta na disku. Uvoľni miesto alebo zmenši výber."
+        read -rp "Stlač Enter pre návrat..." _
+        return
+      fi
+    fi
+    echo
+    read -rp "Enter = stiahnuť | číslo = limit v MB/s (0 = bez limitu) | n = zrušiť košík: " answer
+    case $answer in
+    "") break ;;
+    n | N)
+      return
+      ;;
+    *[!0-9.]*) ;;
+    *) LIMIT_BYTES=$(awk -v m="$answer" 'BEGIN { printf "%d", m * 1048576 }') ;;
+    esac
+  done
+
+  local started=$SECONDS ok=0 failed=0 rest
+  for ((i = 0; i < n; i++)); do
+    rest=0
+    for ((j = i + 1; j < n; j++)); do rest=$((rest + Q_REM[j])); done
+    if download_one "${Q_ID[$i]}" "${Q_REL[$i]}" "${Q_SIZE[$i]}" $((i + 1)) "$n" "$rest" "${Q_MSID[$i]}" "${Q_SUBS[$i]}"; then
+      ok=$((ok + 1))
+    else
+      failed=$((failed + 1))
+    fi
+  done
+
+  echo
+  echo "═══ Hotovo: $ok v poriadku, $failed zlyhalo, čas $(htime $((SECONDS - started))) ═══"
+  if command -v omarchy-notification-send >/dev/null; then
+    omarchy-notification-send "Emby: sťahovanie dokončené" "$ok súborov v poriadku, $failed zlyhalo"
+  fi
+}
+
+# ---------------------------------------------------------------- main loop
+
+reset_cart() {
+  Q_SEEN=()
+  Q_ID=()
+  Q_SIZE=()
+  Q_REL=()
+  Q_MSID=()
+  Q_SUBS=()
+}
+
+SEARCH_LIMIT=100
+
+# search_items <Movie|Series> <text>  ->  {"Items": [...]}
+search_items() {
+  api -G "$SERVER/emby/Users/$uid/Items" \
+    --data-urlencode "SearchTerm=$2" \
+    --data-urlencode "IncludeItemTypes=$1" \
+    --data-urlencode "Recursive=true" \
+    --data-urlencode "Fields=ProductionYear,MediaSources,Overview,ChildCount,RecursiveItemCount" \
+    --data-urlencode "Limit=$SEARCH_LIMIT" |
+    jq -c 'if type == "object" and (.Items | type) == "array" then . else {Items: []} end' 2>/dev/null ||
+    echo '{"Items":[]}'
+}
+
+while true; do
+  if ((${#Q_ID[@]} == 0)); then hint="prázdne = koniec"; else hint="prázdne = ísť na sťahovanie"; fi
+  read -rp "Hľadaj [v košíku: ${#Q_ID[@]}] ($hint; s:text = len seriály, f:text = len filmy): " term
+  if [[ -z $term ]]; then
+    ((${#Q_ID[@]} == 0)) && break
+    checkout
+    reset_cart
+    continue
+  fi
+
+  what=all
+  case $term in
+  [sS]:*)
+    what=series
+    term=${term#*:}
+    ;;
+  [fF]:*)
+    what=movies
+    term=${term#*:}
+    ;;
+  esac
+  term=$(sed 's/^ *//; s/ *$//' <<<"$term")
+  if [[ -z $term ]]; then
+    echo "Zadaj aj hľadaný text."
+    continue
+  fi
+
+  # Series and films are searched separately, so a broad word can no longer
+  # push the series out of the shared result limit.
+  series_json='{"Items":[]}'
+  movie_json='{"Items":[]}'
+  [[ $what != movies ]] && series_json=$(search_items Series "$term")
+  [[ $what != series ]] && movie_json=$(search_items Movie "$term")
+  # (through stdin: real responses are too big for a command-line argument)
+  items=$(printf '%s\n%s\n' "$series_json" "$movie_json" | jq -s '{Items: (.[0].Items + .[1].Items)}')
+  n_series=$(jq '[.Items[] | select(.Type == "Series")] | length' <<<"$items")
+  n_movies=$(jq '[.Items[] | select(.Type == "Movie")] | length' <<<"$items")
+  note=""
+  if ((n_series >= SEARCH_LIMIT || n_movies >= SEARCH_LIMIT)); then
+    note=" (max. $SEARCH_LIMIT z každého druhu, spresni hľadanie)"
+  fi
+
+  list=$(jq -r --argjson lim "$(est_speed)" "$JQ_LIB"'
+    .Items | (map(select(.Type == "Series")) + map(select(.Type != "Series")))[] | [.Id,
+      (if .Type == "Series" then "seriál  " else "film    " end) + title
+        + (if .Type == "Movie" and (.MediaSources[0].Size // 0) > 0 then "  ·  " + (.MediaSources[0].Size | hb) else "" end),
+      .Type, .Name] | @tsv' <<<"$items" 2>/dev/null)
+
+  if [[ -z $list ]]; then
+    echo "Nič sa nenašlo."
+    continue
+  fi
+
+  make_previews "$items"
+
+  picked=$(fzf -m --delimiter=$'\t' --with-nth=2 --prompt="Pridať> " "${FZF_PREVIEW[@]}" \
+    --header="Seriály: $n_series · Filmy: $n_movies$note"$'\n'"Enter = pridať do košíka, Tab = označiť viac, Esc = späť" <<<"$list")
+  [[ -z $picked ]] && continue
+
+  movie_ids=""
+  while IFS=$'\t' read -r id _ type name; do
+    if [[ $type == Series ]]; then
+      series_menu "$id" "$name"
+    else
+      movie_ids+="$id"$'\n'
+    fi
+  done <<<"$picked"
+  [[ -n $movie_ids ]] && queue_add "$items" "$movie_ids"
+done

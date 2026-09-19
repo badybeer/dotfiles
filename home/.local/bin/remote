@@ -1,0 +1,169 @@
+#!/bin/bash
+
+# Remote desktop in one step: pick a Remmina profile, bring the WireGuard VPN up
+# if the host is not reachable without it, open the connection, and take the VPN
+# down again once the last connection to it has ended.
+#
+# Usage: remote [profile name]
+#
+# The VPN is only touched when this script had to bring it up itself; a VPN you
+# started by hand is never switched off. Only host names/ports are read from the
+# Remmina profiles, never passwords.
+#
+# Overrides (used for testing): REMOTE_PROFILE_DIR, REMOTE_WG (default
+# "sudo -n wg-quick"), REMOTE_REMMINA (default "remmina"), REMOTE_VPN_CHECK,
+# REMOTE_START_WAIT, REMOTE_GRACE.
+
+export PATH="/usr/share/omarchy/bin:$HOME/.local/bin:$PATH"
+
+PROFILE_DIR=${REMOTE_PROFILE_DIR:-$HOME/.local/share/remmina}
+WG=${REMOTE_WG:-sudo -n wg-quick}
+REMMINA=${REMOTE_REMMINA:-remmina}
+VPN_IF=${REMOTE_VPN_IF:-wg0}
+START_WAIT=${REMOTE_START_WAIT:-300} # how long to wait for the connection to appear
+GRACE=${REMOTE_GRACE:-20}            # seconds without a connection before the VPN goes down
+STATE_DIR="$HOME/.local/state/remote"
+HOSTS="$STATE_DIR/hosts" # host:port of profiles for which we brought the VPN up
+LOCK="$STATE_DIR/watcher.lock"
+
+mkdir -p "$STATE_DIR"
+
+notify() { omarchy-notification-send -g $'\U000f0483' "$@" >/dev/null 2>&1; }
+
+vpn_up() {
+  if [[ -n ${REMOTE_VPN_CHECK:-} ]]; then
+    bash -c "$REMOTE_VPN_CHECK"
+  else
+    ip link show "$VPN_IF" >/dev/null 2>&1
+  fi
+}
+
+reachable() { # host port
+  timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
+}
+
+connected() { # any established TCP connection to one of the recorded host:port?
+  local hp host port
+  while read -r hp; do
+    [[ -z $hp ]] && continue
+    host=${hp%:*}
+    port=${hp##*:}
+    ss -Htn state established "( dst $host and dport = :$port )" 2>/dev/null | grep -q . && return 0
+  done <"$HOSTS" 2>/dev/null
+  return 1
+}
+
+# -------------------------------------------------------------- watcher (internal)
+
+if [[ ${1:-} == --watch ]]; then
+  exec 9>"$LOCK"
+  flock -n 9 || exit 0 # a watcher is already running
+
+  waited=0
+  while ! connected; do
+    sleep 3
+    waited=$((waited + 3))
+    ((waited >= START_WAIT)) && break
+  done
+
+  idle=0
+  while ((idle < GRACE)); do
+    if connected; then idle=0; else idle=$((idle + 3)); fi
+    sleep 3
+  done
+
+  if vpn_up; then
+    $WG down "$VPN_IF" >/dev/null 2>&1
+    notify "VPN vypnuté" "Vzdialená plocha sa ukončila"
+  fi
+  rm -f "$HOSTS"
+  exit 0
+fi
+
+# -------------------------------------------------------------- pick a profile
+
+declare -A FILE_OF=() SERVER_OF=() PROTO_OF=()
+names=()
+for f in "$PROFILE_DIR"/*.remmina; do
+  [[ -f $f ]] || continue
+  name=$(grep -m1 '^name=' "$f" | cut -d= -f2-)
+  [[ -z $name ]] && continue
+  names+=("$name")
+  FILE_OF[$name]=$f
+  SERVER_OF[$name]=$(grep -m1 '^server=' "$f" | cut -d= -f2-)
+  PROTO_OF[$name]=$(grep -m1 '^protocol=' "$f" | cut -d= -f2-)
+done
+
+if ((${#names[@]} == 0)); then
+  echo "V $PROFILE_DIR nie sú žiadne profily Remmina."
+  sleep 4
+  exit 1
+fi
+
+choice=${1:-}
+if [[ -z $choice ]]; then
+  vpn_state="VPN: vypnutá"
+  vpn_up && vpn_state="VPN: zapnutá"
+  choice=$(printf '%s\n' "${names[@]}" | fzf --prompt="Vzdialená plocha> " --header="$vpn_state · Enter = pripojiť" --height=100%) || exit 0
+fi
+[[ -n ${FILE_OF[$choice]:-} ]] || {
+  echo "Profil '$choice' neexistuje."
+  sleep 4
+  exit 1
+}
+
+file=${FILE_OF[$choice]}
+server=${SERVER_OF[$choice]}
+host=${server%%:*}
+if [[ $server == *:* && $server != *:*:* ]]; then # host:port (not IPv6)
+  port=${server##*:}
+else
+  case ${PROTO_OF[$choice]} in
+  VNC | SPICE) port=5900 ;;
+  SSH | SFTP) port=22 ;;
+  *) port=3389 ;;
+  esac
+fi
+
+# -------------------------------------------------------------- VPN if needed
+
+echo "Profil: $choice ($host:$port)"
+started_vpn=false
+
+if reachable "$host" "$port"; then
+  echo "Server je dostupný, VPN netreba."
+elif vpn_up; then
+  echo "VPN už beží, ale server neodpovedá. Skúsim sa aj tak pripojiť."
+else
+  echo "Server nie je dostupný, zapínam VPN..."
+  if ! $WG up "$VPN_IF" >/dev/null 2>&1; then
+    echo "VPN sa nepodarilo zapnúť."
+    notify "VPN sa nepodarilo zapnúť" "Skús to ručne (ikona VPN v lište)"
+    sleep 4
+    exit 1
+  fi
+  started_vpn=true
+  for _ in $(seq 1 10); do
+    reachable "$host" "$port" && break
+    sleep 1
+  done
+  if reachable "$host" "$port"; then
+    echo "VPN zapnutá, server odpovedá."
+  else
+    echo "VPN je zapnutá, ale server zatiaľ neodpovedá (pripájam sa aj tak)."
+  fi
+fi
+
+# -------------------------------------------------------------- connect
+
+echo "Otváram $choice..."
+setsid -f $REMMINA -c "$file" >/dev/null 2>&1
+
+# If we own the VPN (started now, or earlier by another run that is still being
+# watched), remember this host too so the VPN stays up until all of them are done.
+if $started_vpn || [[ -s $HOSTS ]]; then
+  echo "$host:$port" >>"$HOSTS"
+  setsid -f "$0" --watch >/dev/null 2>&1
+  echo "VPN sa vypne sama po ukončení pripojenia."
+fi
+sleep 2

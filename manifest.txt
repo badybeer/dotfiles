@@ -1,0 +1,38 @@
+# Paths relative to $HOME that are backed up. Directories are mirrored, files copied.
+# Nothing with passwords, keys or tokens belongs here.
+
+# scripts
+.local/bin/chat-hub
+.local/bin/chat-hub-help
+.local/bin/emby-dl
+.local/bin/emby-dl-window
+.local/bin/kino
+.local/bin/remote
+.local/bin/remote-window
+.local/bin/tsukimi-open
+.local/bin/dotfiles-sync
+
+# hyprland
+.config/hypr/autostart.lua
+.config/hypr/bindings.lua
+.config/hypr/hyprland.lua
+.config/hypr/input.lua
+.config/hypr/looknfeel.lua
+.config/hypr/monitors.lua
+.config/hypr/hyprsunset.conf
+.config/hypr/xdph.conf
+
+# omarchy shell / bar
+.config/omarchy/shell.json
+.config/omarchy/shell.toml
+.config/omarchy/bar
+.config/omarchy/extensions
+.config/omarchy/branding
+.config/omarchy/defaults
+
+# launchers (webapps + emby downloader)
+.local/share/applications/Messenger.desktop
+.local/share/applications/Instagram.desktop
+.local/share/applications/Teams.desktop
+.local/share/applications/Emby-Stiahnut.desktop
+.local/share/icons/hicolor/48x48/apps/emby-dl.png

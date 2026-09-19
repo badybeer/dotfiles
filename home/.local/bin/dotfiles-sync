@@ -1,0 +1,202 @@
+#!/bin/bash
+
+# Back up / restore the personal setup listed in ~/dotfiles/manifest.txt.
+#
+# Usage: dotfiles-sync [backup|restore|status]
+#   backup   (default) copy the live files into the repo, scan for secrets, commit and push
+#   restore  copy the repo files back into $HOME (an existing different file is kept as .bak-<time>)
+#   status   show what differs between the live files and the repo
+#
+# Env: DOTFILES_REPO (default ~/dotfiles), DOTFILES_NO_PUSH=1 (commit only)
+
+set -uo pipefail
+
+REPO=${DOTFILES_REPO:-$HOME/dotfiles}
+MANIFEST="$REPO/manifest.txt"
+STORE="$REPO/home"
+
+die() {
+  echo "Chyba: $*" >&2
+  exit 1
+}
+
+[[ -f $MANIFEST ]] || die "chýba $MANIFEST"
+
+paths() { grep -vE '^\s*(#|$)' "$MANIFEST"; }
+
+# Patterns that look like real secrets. Code that merely mentions a "token" or
+# "password" variable does not match these.
+SECRET_RE='BEGIN [A-Z ]*PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{24,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.|^\s*PrivateKey\s*=|^\s*PresharedKey\s*=|(password|passwd|pw)\s*=\s*["'\''][^"'\''$]{4,}["'\'']'
+
+# ---- privacy guard: the repository is PUBLIC ---------------------------------
+# Things that must never be published. Besides real secrets this covers personal
+# data: e-mail addresses, public IP addresses and anything listed in the local
+# (not backed up) deny list ~/.config/dotfiles-sync/never-publish.txt, plus the
+# hosts found in the local Remmina profiles and the saved Emby server address.
+
+DENY_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/dotfiles-sync/never-publish.txt"
+
+deny_terms() {
+  {
+    [[ -f $DENY_FILE ]] && grep -vE '^\s*(#|$)' "$DENY_FILE"
+    # hosts of the local Remmina profiles
+    for f in "$HOME"/.local/share/remmina/*.remmina; do
+      [[ -f $f ]] && grep -m1 '^server=' "$f" | cut -d= -f2- | sed 's/:[0-9]*$//'
+    done
+    # saved Emby server, without the scheme
+    [[ -f $HOME/.config/emby-dl/server ]] && sed -E 's#^https?://##; s#[:/].*$##' "$HOME/.config/emby-dl/server"
+    git config --global user.email 2>/dev/null
+  } | awk 'length($0) >= 4' | sort -u
+}
+
+scan_secrets() {
+  local hits terms files
+
+  # 1. things that look like real secrets
+  hits=$(grep -rInE "$SECRET_RE" "$STORE" 2>/dev/null)
+  if [[ -n $hits ]]; then
+    echo "!!! V zálohe sú veci, ktoré vyzerajú ako tajomstvá. Nič sa neodoslalo:" >&2
+    echo "$hits" | cut -c1-160 >&2
+    return 1
+  fi
+
+  # 2. files that must not be here at all
+  files=$(find "$STORE" -type f \( -name '*.remmina' -o -name '*.key' -o -name '*.pem' -o -name 'wg*.conf' -o -name '*.kdbx' \))
+  if [[ -n $files ]]; then
+    echo "!!! V zálohe sú súbory, ktoré tam nemajú byť:" >&2
+    echo "$files" >&2
+    return 1
+  fi
+
+  # 3. e-mail addresses (except the GitHub/Anthropic no-reply ones)
+  hits=$(grep -rInE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' "$STORE" "$REPO/README.md" "$REPO/manifest.txt" "$REPO/restore" 2>/dev/null |
+    grep -vE 'noreply@anthropic\.com|@users\.noreply\.github\.com')
+  if [[ -n $hits ]]; then
+    echo "!!! V zálohe je e-mailová adresa (repozitár je verejný). Nič sa neodoslalo:" >&2
+    echo "$hits" | cut -c1-160 >&2
+    return 1
+  fi
+
+  # 4. public IPv4 addresses (private, loopback and 0.0.0.0 are fine)
+  hits=$(grep -rInE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' "$STORE" "$REPO/README.md" "$REPO/restore" 2>/dev/null |
+    grep -vE '\b(127\.[0-9.]+|10\.[0-9.]+|192\.168\.[0-9.]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9.]+|0\.0\.0\.0|255\.[0-9.]+)\b')
+  if [[ -n $hits ]]; then
+    echo "!!! V zálohe je verejná IP adresa. Nič sa neodoslalo:" >&2
+    echo "$hits" | cut -c1-160 >&2
+    return 1
+  fi
+
+  # 5. the personal deny list
+  terms=$(deny_terms)
+  if [[ -n $terms ]]; then
+    hits=$(grep -rInFi -f <(printf '%s\n' "$terms") "$STORE" "$REPO/README.md" "$REPO/manifest.txt" "$REPO/restore" "$REPO/packages-aur.txt" 2>/dev/null)
+    if [[ -n $hits ]]; then
+      echo "!!! V zálohe je osobný údaj zo zoznamu zakázaných vecí. Nič sa neodoslalo:" >&2
+      echo "$hits" | cut -c1-160 >&2
+      return 1
+    fi
+  fi
+
+  # 6. commits must not carry a personal e-mail
+  local email
+  email=$(git -C "$REPO" config user.email)
+  if [[ $email != *@users.noreply.github.com ]]; then
+    echo "!!! Git e-mail v repozitári je '$email'. Použi GitHub no-reply adresu:" >&2
+    echo "    git -C $REPO config user.email <id>+<meno>@users.noreply.github.com" >&2
+    return 1
+  fi
+}
+
+do_backup() {
+  local p src
+  while read -r p; do
+    src="$HOME/$p"
+    if [[ -d $src ]]; then
+      mkdir -p "$STORE/$p"
+      rsync -a --delete "$src/" "$STORE/$p/"
+    elif [[ -f $src ]]; then
+      mkdir -p "$(dirname "$STORE/$p")"
+      cp -p "$src" "$STORE/$p"
+    else
+      echo "Preskakujem (neexistuje): $p" >&2
+    fi
+  done < <(paths)
+
+  # AUR / foreign packages, to know what to reinstall by hand
+  pacman -Qqem >"$REPO/packages-aur.txt" 2>/dev/null
+
+  scan_secrets || exit 1
+
+  cd "$REPO" || exit 1
+  git add -A
+  if git diff --cached --quiet; then
+    echo "Nič nové na zálohu."
+    return 0
+  fi
+  git commit -q -m "Záloha $(date '+%F %H:%M')" || die "commit zlyhal"
+  echo "Commit vytvorený: $(git log -1 --format='%h %s')"
+
+  if git log --format='%ae%n%ce' | grep -vE '@users\.noreply\.github\.com$|^noreply@anthropic\.com$' | grep -q .; then
+    echo "!!! V histórii commitov je iný e-mail ako GitHub no-reply. Push sa nespustil." >&2
+    exit 1
+  fi
+
+  if [[ ${DOTFILES_NO_PUSH:-} == 1 ]]; then
+    echo "Push preskočený (DOTFILES_NO_PUSH=1)."
+  elif git remote get-url origin >/dev/null 2>&1; then
+    git push -q origin HEAD && echo "Odoslané na GitHub."
+  else
+    echo "Repozitár nemá nastavený vzdialený server (origin), nič sa neodoslalo." >&2
+  fi
+}
+
+do_restore() {
+  local p src dst ts
+  ts=$(date +%s)
+  while read -r p; do
+    src="$STORE/$p"
+    dst="$HOME/$p"
+    if [[ -d $src ]]; then
+      mkdir -p "$dst"
+      rsync -a --backup --suffix=".bak-$ts" "$src/" "$dst/"
+    elif [[ -f $src ]]; then
+      mkdir -p "$(dirname "$dst")"
+      if [[ -e $dst ]] && ! cmp -s "$src" "$dst"; then
+        cp -p "$dst" "$dst.bak-$ts"
+      fi
+      cp -p "$src" "$dst"
+    else
+      echo "V zálohe chýba: $p" >&2
+    fi
+  done < <(paths)
+  echo "Obnovené. Pôvodné odlišné súbory sú uložené ako *.bak-$ts."
+  echo "Ďalšie kroky nájdeš v $REPO/README.md (Hyprland: hyprctl reload)."
+}
+
+do_status() {
+  local p src changed=0
+  while read -r p; do
+    src="$HOME/$p"
+    if [[ -d $src ]]; then
+      out=$(rsync -ain --delete "$src/" "$STORE/$p/" | grep -v '^\.d' )
+    elif [[ -f $src ]]; then
+      out=$(cmp -s "$src" "$STORE/$p" 2>/dev/null || echo "zmenené: $p")
+    else
+      continue
+    fi
+    if [[ -n $out ]]; then
+      changed=1
+      echo "== $p"
+      echo "$out" | sed 's/^/   /'
+    fi
+  done < <(paths)
+  ((changed == 0)) && echo "Všetko je zálohované, nič sa nezmenilo."
+  return 0
+}
+
+case ${1:-backup} in
+backup) do_backup ;;
+restore) do_restore ;;
+status) do_status ;;
+*) die "použitie: dotfiles-sync [backup|restore|status]" ;;
+esac

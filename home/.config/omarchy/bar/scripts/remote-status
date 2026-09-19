@@ -1,0 +1,7 @@
+#!/bin/bash
+# Bar icon for the remote-desktop picker; highlighted while the WireGuard VPN is up.
+if ip link show wg0 >/dev/null 2>&1; then
+  printf '{"text":"%s","tooltip":"Vzdialená plocha (SUPER+SHIFT+R) - VPN zapnutá","class":"active"}\n' $''
+else
+  printf '{"text":"%s","tooltip":"Vzdialená plocha (SUPER+SHIFT+R)","class":"inactive"}\n' $''
+fi

@@ -1,0 +1,5 @@
+#!/bin/bash
+
+# Open Tsukimi (Emby client) or focus it if already running.
+
+omarchy-launch-or-focus moe.tsuna.tsukimi 'uwsm-app -- tsukimi'

@@ -1,0 +1,6 @@
+#!/bin/bash
+
+# Open emby-dl in its own floating terminal (or focus it if already open).
+
+omarchy-launch-or-focus-tui --app-id=org.omarchy.emby-dl \
+  bash -c '/home/bady/.local/bin/emby-dl; read -rp "Stlač Enter pre zatvorenie..."'

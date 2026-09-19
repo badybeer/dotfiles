@@ -1,0 +1,93 @@
+#!/bin/bash
+
+# Cinema mode: no idle lock/screensaver, no notification pop-ups, bar hidden.
+#
+# Usage: kino [toggle|on|off|status]
+#
+# Only what this script changed is undone again: if "stay awake" was already on
+# before, it stays on after `kino off`. As a safety net the mode switches itself
+# off after KINO_MAX_HOURS (default 4), so the screen cannot stay unlocked forever
+# if you forget it.
+
+export PATH="/usr/share/omarchy/bin:$HOME/.local/bin:$PATH"
+
+STATE_DIR="$HOME/.local/state/kino"
+STATE="$STATE_DIR/changed"
+TIMER=kino-auto-off
+MAX_HOURS=${KINO_MAX_HOURS:-4}
+GLYPH=$'\U000f0381' # film
+
+active() { [[ -f $STATE ]]; }
+changed() { grep -qx "$1" "$STATE" 2>/dev/null; }
+
+notify() { omarchy-notification-send -g "$GLYPH" "$@" >/dev/null 2>&1; }
+
+turn_on() {
+  if active; then
+    echo "Kino režim už beží."
+    return 0
+  fi
+
+  mkdir -p "$STATE_DIR"
+  : >"$STATE"
+
+  # Tell the user first: do-not-disturb would swallow this notification.
+  notify "Kino režim zapnutý" "Vypnutie: SUPER + SHIFT + K (samo sa vypne o ${MAX_HOURS} h)"
+
+  if [[ $(omarchy-toggle-idle status | jq -r '.enabled') != true ]]; then
+    omarchy-toggle-idle stay-awake >/dev/null
+    echo idle >>"$STATE"
+  fi
+
+  if [[ $(omarchy-shell notifications dndState 2>/dev/null) == off ]]; then
+    omarchy-shell notifications setDnd on >/dev/null 2>&1
+    omarchy-shell -q omarchy.indicators refresh
+    echo dnd >>"$STATE"
+  fi
+
+  if ! omarchy-toggle-enabled bar-off; then
+    omarchy-toggle-bar on
+    echo bar >>"$STATE"
+  fi
+
+  systemctl --user stop "$TIMER.timer" "$TIMER.service" 2>/dev/null
+  systemd-run --user --quiet --unit="$TIMER" --on-active="${MAX_HOURS}h" "$0" off --auto
+}
+
+turn_off() {
+  if ! active; then
+    echo "Kino režim nebeží."
+    return 0
+  fi
+
+  changed bar && omarchy-toggle-bar off
+  if changed dnd; then
+    omarchy-shell notifications setDnd off >/dev/null 2>&1
+    omarchy-shell -q omarchy.indicators refresh
+  fi
+  changed idle && omarchy-toggle-idle allow-idle >/dev/null
+
+  rm -f "$STATE"
+  systemctl --user stop "$TIMER.timer" "$TIMER.service" 2>/dev/null
+
+  if [[ ${2:-} == --auto ]]; then
+    notify "Kino režim vypnutý" "Vypol sa automaticky po ${MAX_HOURS} h"
+  else
+    notify "Kino režim vypnutý"
+  fi
+}
+
+case ${1:-toggle} in
+toggle)
+  if active; then turn_off; else turn_on; fi
+  ;;
+on) turn_on ;;
+off) turn_off "$@" ;;
+status)
+  if active; then echo "zapnutý ($(paste -sd, "$STATE"))"; else echo "vypnutý"; fi
+  ;;
+*)
+  echo "Použitie: kino [toggle|on|off|status]" >&2
+  exit 1
+  ;;
+esac

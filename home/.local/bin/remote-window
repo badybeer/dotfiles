@@ -1,0 +1,5 @@
+#!/bin/bash
+
+# Open the remote-desktop picker in its own floating terminal.
+
+exec omarchy-launch-tui --app-id=org.omarchy.remote /home/bady/.local/bin/remote

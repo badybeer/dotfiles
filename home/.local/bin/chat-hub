@@ -1,0 +1,115 @@
+#!/bin/bash
+
+# Chat hub: all chat apps as one tabbed Hyprland group on workspace 10.
+# Opens only the apps that are missing. The window rule in hyprland.lua sends
+# them to workspace 10 and Hyprland groups them into tabs, in the order below.
+# Any window that still ended up outside the group is merged into it at the end.
+#
+# Usage: chat-hub [--background]
+#   --background  skip apps marked |lazy, and return to the workspace you were on
+
+WORKSPACE=10
+
+# class|command[|lazy]  -- order here is the tab order.
+apps=(
+  'org\.telegram\.desktop|uwsm-app -- Telegram'
+  'chrome-discord\.com|omarchy-launch-webapp https://discord.com/channels/@me'
+  'chrome-www\.messenger\.com|omarchy-launch-webapp https://www.messenger.com/'
+  'chrome-www\.instagram\.com|omarchy-launch-webapp https://www.instagram.com/direct/inbox/'
+  'chrome-web\.whatsapp\.com|omarchy-launch-webapp https://web.whatsapp.com/'
+  'chrome-teams\.microsoft\.com|omarchy-launch-webapp https://teams.microsoft.com/|lazy'
+)
+
+window_exists() {
+  hyprctl clients -j | jq -e --arg p "^$1" 'any(.[]; .class | test($p))' >/dev/null
+}
+
+focus_workspace() {
+  hyprctl dispatch "hl.dsp.focus({ workspace = \"$1\" })" >/dev/null
+}
+
+focus_window() {
+  hyprctl dispatch "hl.dsp.focus({ window = \"address:$1\" })" >/dev/null
+}
+
+# Regex matching every chat window class.
+chat_regex() {
+  local joined="" app
+  for app in "${apps[@]}"; do
+    joined+="${joined:+|}^${app%%|*}"
+  done
+  printf '%s' "$joined"
+}
+
+# Addresses of chat windows that are not in the largest chat group.
+loose_windows() {
+  hyprctl clients -j | jq -r --arg p "$(chat_regex)" '
+    [.[] | select(.class | test($p))] as $chat
+    | ($chat | sort_by(-(.grouped | length)) | .[0].grouped // []) as $anchor
+    | $chat[] | select(.address as $a | ($anchor | index($a)) == null) | .address'
+}
+
+# Address of the last tab of the largest chat group (empty if there is none).
+last_tab() {
+  hyprctl clients -j | jq -r --arg p "$(chat_regex)" '
+    [.[] | select(.class | test($p))]
+    | sort_by(-(.grouped | length)) | .[0].grouped // [] | last // empty'
+}
+
+group_size() {
+  hyprctl clients -j | jq -r --arg a "$1" '.[] | select(.address == $a) | .grouped | length'
+}
+
+# Move a window into the neighbouring group, whichever side it is on.
+merge_into_group() {
+  local address=$1 direction
+  focus_window "$address"
+  for direction in l r u d; do
+    hyprctl dispatch "hl.dsp.window.move({ into_group = \"$direction\" })" >/dev/null
+    (( $(group_size "$address") > 1 )) && return
+  done
+}
+
+background=false
+previous=
+if [[ ${1:-} == --background ]]; then
+  background=true
+  previous=$(hyprctl activeworkspace -j | jq -r '.id')
+fi
+
+focus_workspace "$WORKSPACE"
+
+for app in "${apps[@]}"; do
+  class=${app%%|*}
+  command=${app#*|}
+
+  if [[ $command == *"|lazy" ]]; then
+    command=${command%|lazy}
+    $background && continue
+  fi
+
+  window_exists "$class" && continue
+
+  # New tabs open right after the active one; focus the last tab to append.
+  last=$(last_tab)
+  [[ -n $last ]] && focus_window "$last"
+
+  setsid bash -c "$command" >/dev/null 2>&1 &
+
+  # Wait for the window so the next one opens into the focused group.
+  for _ in $(seq 1 60); do
+    window_exists "$class" && break
+    sleep 0.5
+  done
+done
+
+# Safety net: pull in anything that opened outside the group.
+sleep 1
+focus_workspace "$WORKSPACE"
+while read -r address; do
+  [[ -n $address ]] && merge_into_group "$address"
+done < <(loose_windows)
+
+if [[ -n $previous && $previous != "$WORKSPACE" ]]; then
+  focus_workspace "$previous"
+fi

@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# Short controls legend for the chat hub, shown as a notification.
+
+omarchy-notification-send -t 15000 -g 󰭹 "Chat hub" "SUPER + M   open / go to hub
+SUPER + 0   workspace 10
+SUPER + ALT + 1-6   Telegram, Discord, Messenger, Instagram, WhatsApp, Teams
+SUPER + CTRL + ← →   previous / next
+SUPER + ALT + TAB   next
+SUPER + CTRL + ,   silence notifications (toggle)"
