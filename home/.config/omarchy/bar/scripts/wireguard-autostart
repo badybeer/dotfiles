@@ -1,0 +1,4 @@
+#!/bin/bash
+# Bring WireGuard up at login unless it is already up (the bar button toggles it afterwards).
+ip link show wg0 &>/dev/null && exit 0
+sudo -n wg-quick up wg0

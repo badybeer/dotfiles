@@ -24,6 +24,11 @@
 # Server: the address is read from ~/.config/emby-dl/server (asked once on the first
 # run and saved there, so it is not part of any backup of this script).
 #
+# Browsing: type "b" at the search prompt to browse without searching. Pick films / series, then
+# filters (unwatched, rating 7+/8+, genre; Tab = several at once) and a sort order (newest added,
+# best rated, release year, name, length, random pick). Results go to the same cart.
+# The list shows the rating (★) and the preview shows rating, genres and the description.
+#
 # Env: EMBY_SERVER (overrides the saved address), EMBY_DEST (default ~/Videos/Emby),
 #      EMBY_LIMIT  max download speed, e.g. 4M (default 0 = unlimited). It can also be
 #                  changed in the cart screen before each download.
@@ -128,30 +133,39 @@ def rel:
     ((.SeriesName // "?") | san) + "/Season " + ((.ParentIndexNumber // 0) | pad) + "/"
     + ((.SeriesName // "?") | san) + " - " + epcode + " - " + (.Name | san) + "." + ext
   else (title | san) + "." + ext end;
+def rating: "★ " + (((.CommunityRating * 10) | round) / 10 | tostring);
+def meta:
+  ([ (if .CommunityRating then rating else empty end),
+     (if .CriticRating then "kritici \(.CriticRating | round) %" else empty end),
+     (.OfficialRating // empty) ] | join(" · ")) as $r
+  | [ (if $r != "" then "Hodnotenie: " + $r else empty end),
+      (if (.Genres // []) | length > 0 then "Žánre:      " + (.Genres | join(", ")) else empty end) ];
+def blurb: if (.Overview // "") != "" then ["", (.Overview | .[0:700])] else [] end;
 def preview:
   (.MediaSources[0] // {}) as $m
   | ($m.Size // 0) as $sz
   | ($m.MediaStreams // []) as $st
   | ($st | map(select(.Type == "Video")) | .[0]) as $v
   | if .Type == "Series" then
-      [ title, "", "Seriál", (if .ChildCount then "Sérií: \(.ChildCount)" else empty end),
-        (if .RecursiveItemCount then "Epizód: \(.RecursiveItemCount)" else empty end),
-        "", "Po výbere si zvolíš: celý seriál, celé série alebo jednotlivé epizódy.",
-        "", ((.Overview // "") | .[0:400]) ] | join("\n")
+      ([ title, "" ] + meta
+       + [ "Seriál", (if .ChildCount then "Sérií: \(.ChildCount)" else empty end),
+           (if .RecursiveItemCount then "Epizód: \(.RecursiveItemCount)" else empty end),
+           "", "Po výbere si zvolíš: celý seriál, celé série alebo jednotlivé epizódy." ]
+       + blurb) | join("\n")
     else
-      [ (if .Type == "Episode" then "\(.SeriesName // "?") \(epcode) - \(.Name)" else title end),
-        "",
-        "Veľkosť:    " + ($sz | hb),
-        "Dĺžka:      " + (((.RunTimeTicks // 0) / 10000000) | ht),
-        "Formát:     " + (($m.Container // "?") | split(",")[0])
-          + (if $v then " · \($v.Width // "?" | tostring)x\($v.Height // "?" | tostring) · \($v.Codec // "?")" else "" end),
-        "Zvuk:       " + ($st | map(select(.Type == "Audio")) | map((.Language // "?") + " " + (.Codec // "")) | join(", ")),
-        "Titulky:    " + ($st | map(select(.Type == "Subtitle")) | map(.Language // "?") | unique | join(", "))
-          + (extsubs | length | if . > 0 then "  (externých súborov: \(.), stiahnu sa spolu s videom)" else "" end),
-        "Sťahovanie: " + (if $lim > 0 and $sz > 0 then "~" + (($sz / $lim) | ht) + " pri " + ($lim | hb) + "/s"
-                          else "závisí od rýchlosti siete" end),
-        (if (.MediaSources | length) > 1 then "Verzií súboru: \(.MediaSources | length) (stiahne sa prvá)" else empty end)
-      ] | join("\n")
+      ([ (if .Type == "Episode" then "\(.SeriesName // "?") \(epcode) - \(.Name)" else title end),
+         "" ] + meta
+       + [ "Veľkosť:    " + ($sz | hb),
+           "Dĺžka:      " + (((.RunTimeTicks // 0) / 10000000) | ht),
+           "Formát:     " + (($m.Container // "?") | split(",")[0])
+             + (if $v then " · \($v.Width // "?" | tostring)x\($v.Height // "?" | tostring) · \($v.Codec // "?")" else "" end),
+           "Zvuk:       " + ($st | map(select(.Type == "Audio")) | map((.Language // "?") + " " + (.Codec // "")) | join(", ")),
+           "Titulky:    " + ($st | map(select(.Type == "Subtitle")) | map(.Language // "?") | unique | join(", "))
+             + (extsubs | length | if . > 0 then "  (externých súborov: \(.), stiahnu sa spolu s videom)" else "" end),
+           "Sťahovanie: " + (if $lim > 0 and $sz > 0 then "~" + (($sz / $lim) | ht) + " pri " + ($lim | hb) + "/s"
+                             else "závisí od rýchlosti siete" end),
+           (if (.MediaSources | length) > 1 then "Verzií súboru: \(.MediaSources | length) (stiahne sa prvá)" else empty end) ]
+       + blurb) | join("\n")
     end;
 EOF
 
@@ -318,7 +332,7 @@ series_menu() {
   eps=$(api -G "$SERVER/emby/Users/$uid/Items" \
     --data-urlencode "ParentId=$sid" --data-urlencode "Recursive=true" \
     --data-urlencode "IncludeItemTypes=Episode" \
-    --data-urlencode "Fields=MediaSources,ProductionYear" --data-urlencode "Limit=5000" |
+    --data-urlencode "Fields=MediaSources,ProductionYear,Overview,CommunityRating,CriticRating,OfficialRating,Genres" --data-urlencode "Limit=5000" |
     jq '.Items |= (map(select((.MediaSources | length) > 0 and (.LocationType // "FileSystem") != "Virtual"))
         | sort_by([(.ParentIndexNumber // 0), (.IndexNumber // 0)]))')
 
@@ -624,6 +638,8 @@ reset_cart() {
 }
 
 SEARCH_LIMIT=100
+BROWSE_LIMIT=200
+BROWSE_FIELDS="ProductionYear,MediaSources,Overview,ChildCount,RecursiveItemCount,DateCreated,CommunityRating,CriticRating,OfficialRating,Genres"
 
 # search_items <Movie|Series> <text>  ->  {"Items": [...]}
 search_items() {
@@ -631,19 +647,178 @@ search_items() {
     --data-urlencode "SearchTerm=$2" \
     --data-urlencode "IncludeItemTypes=$1" \
     --data-urlencode "Recursive=true" \
-    --data-urlencode "Fields=ProductionYear,MediaSources,Overview,ChildCount,RecursiveItemCount" \
+    --data-urlencode "Fields=ProductionYear,MediaSources,Overview,ChildCount,RecursiveItemCount,CommunityRating,CriticRating,OfficialRating,Genres" \
     --data-urlencode "Limit=$SEARCH_LIMIT" |
     jq -c 'if type == "object" and (.Items | type) == "array" then . else {Items: []} end' 2>/dev/null ||
     echo '{"Items":[]}'
 }
 
+# browse_items <types> <sort by> <Ascending|Descending> [extra query params...]  ->  {"Items": [...]}
+# BROWSE_LIMIT can be overridden for a single call: BROWSE_LIMIT=50 browse_items ...
+browse_items() {
+  local types=$1 sort=$2 order=$3 p
+  local -a extra=()
+  shift 3
+  for p in "$@"; do extra+=(--data-urlencode "$p"); done
+  api -G "$SERVER/emby/Users/$uid/Items" \
+    --data-urlencode "IncludeItemTypes=$types" \
+    --data-urlencode "Recursive=true" \
+    --data-urlencode "SortBy=$sort" --data-urlencode "SortOrder=$order" \
+    --data-urlencode "Fields=$BROWSE_FIELDS" \
+    --data-urlencode "Limit=$BROWSE_LIMIT" "${extra[@]}" |
+    jq -c 'if type == "object" and (.Items | type) == "array" then . else {Items: []} end' 2>/dev/null ||
+    echo '{"Items":[]}'
+}
+
+# Lists the genres that exist among the given item types and lets the user pick one.
+pick_genre() {
+  api -G "$SERVER/emby/Genres" \
+    --data-urlencode "UserId=$uid" --data-urlencode "Recursive=true" \
+    --data-urlencode "IncludeItemTypes=$1" --data-urlencode "SortBy=SortName" |
+    jq -r '.Items[]?.Name' |
+    fzf --prompt="Žáner> " --header="Vyber žáner (Esc = späť)"
+}
+
+# present_items <items json> <grouped|asis> <limit> [label]
+# Shows the results in fzf and puts the picked films / series into the cart.
+# "grouped" lists series before films (search); "asis" keeps the server order (browsing).
+present_items() {
+  local items=$1 order=$2 limit=$3 label=${4:-}
+  local n_series n_movies note="" list picked id type name movie_ids=""
+
+  n_series=$(jq '[.Items[] | select(.Type == "Series")] | length' <<<"$items")
+  n_movies=$(jq '[.Items[] | select(.Type == "Movie")] | length' <<<"$items")
+  if ((n_series >= limit || n_movies >= limit)); then
+    if [[ $order == grouped ]]; then
+      note=" (max. $limit z každého druhu, spresni hľadanie)"
+    else
+      note=" (zobrazených prvých $limit)"
+    fi
+  fi
+
+  list=$(jq -r --arg order "$order" --argjson lim "$(est_speed)" "$JQ_LIB"'
+    .Items | (if $order == "grouped" then (map(select(.Type == "Series")) + map(select(.Type != "Series"))) else . end)[]
+    | [.Id,
+      (if .Type == "Series" then "seriál  " else "film    " end) + title
+        + (if .Type == "Movie" and (.MediaSources[0].Size // 0) > 0 then "  ·  " + (.MediaSources[0].Size | hb) else "" end)
+        + (if .CommunityRating then "  ·  " + rating else "" end)
+        + (if .DateCreated then "  ·  pridané " + .DateCreated[0:10] else "" end),
+      .Type, .Name] | @tsv' <<<"$items" 2>/dev/null)
+
+  if [[ -z $list ]]; then
+    echo "Nič sa nenašlo."
+    return
+  fi
+
+  make_previews "$items"
+
+  picked=$(fzf -m --delimiter=$'\t' --with-nth=2 --prompt="Pridať> " "${FZF_PREVIEW[@]}" \
+    --header="${label:+$label · }Seriály: $n_series · Filmy: $n_movies$note"$'\n'"Enter = pridať do košíka, Tab = označiť viac, Esc = späť" <<<"$list")
+  [[ -z $picked ]] && return
+
+  while IFS=$'\t' read -r id _ type name; do
+    if [[ $type == Series ]]; then
+      series_menu "$id" "$name"
+    else
+      movie_ids+="$id"$'\n'
+    fi
+  done <<<"$picked"
+  [[ -n $movie_ids ]] && queue_add "$items" "$movie_ids"
+}
+
+# Browse the library without typing a search: pick what to include, optional filters and the sort order.
+browse() {
+  local types filters sort_id genre="" items label limit=$BROWSE_LIMIT
+  local sort_by sort_order sort_label
+  local -a extra=() parts=()
+  local min_rating=""
+
+  types=$(printf '%s\t%s\n' "Movie,Series" "Filmy aj seriály" "Movie" "Len filmy" "Series" "Len seriály" |
+    fzf --delimiter=$'\t' --with-nth=2 --prompt="Prehliadať> " --header="Čo chceš prehliadať? (Esc = späť)" | cut -f1)
+  [[ -z $types ]] && return
+
+  filters=$(printf '%s\t%s\n' \
+    none "Bez filtra" \
+    unplayed "Len nepozreté" \
+    r7 "Hodnotenie aspoň 7" \
+    r8 "Hodnotenie aspoň 8" \
+    genre "Žáner…" |
+    fzf -m --delimiter=$'\t' --with-nth=2 --prompt="Filter> " \
+      --header="Tab = označiť viac filtrov naraz, Enter = pokračovať (Esc = späť)" | cut -f1) || return
+  [[ -z $filters ]] && return
+
+  if grep -qx genre <<<"$filters"; then
+    genre=$(pick_genre "$types")
+    [[ -z $genre ]] && return
+    extra+=("Genres=$genre")
+    parts+=("Žáner: $genre")
+  fi
+  if grep -qx unplayed <<<"$filters"; then
+    extra+=("Filters=IsUnplayed")
+    parts+=("nepozreté")
+  fi
+  if grep -qx r8 <<<"$filters"; then
+    min_rating=8
+  elif grep -qx r7 <<<"$filters"; then
+    min_rating=7
+  fi
+  if [[ -n $min_rating ]]; then
+    extra+=("MinCommunityRating=$min_rating")
+    parts+=("★ $min_rating+")
+  fi
+
+  local sort_menu
+  sort_menu=$(printf '%s\t%s\n' \
+    recent "Nedávno pridané" \
+    rating "Najlepšie hodnotené" \
+    year_new "Najnovšie vydané" \
+    year_old "Najstaršie vydané" \
+    name "Názov A–Z" \
+    random "Náhodný výber (50 kusov)")
+  if [[ $types == Movie ]]; then
+    sort_menu+=$'\n'$(printf '%s\t%s\n' long "Najdlhšie filmy" short "Najkratšie filmy")
+  fi
+  sort_id=$(fzf --delimiter=$'\t' --with-nth=2 --prompt="Zoradiť> " \
+    --header="Ako to chceš zoradiť? (Esc = späť)" <<<"$sort_menu" | cut -f1)
+  [[ -z $sort_id ]] && return
+
+  case $sort_id in
+  recent) sort_by=DateCreated sort_order=Descending sort_label="najnovšie pridané" ;;
+  rating) sort_by=CommunityRating,SortName sort_order=Descending sort_label="podľa hodnotenia" ;;
+  year_new) sort_by=ProductionYear,PremiereDate,SortName sort_order=Descending sort_label="najnovšie vydané" ;;
+  year_old)
+    sort_by=ProductionYear,PremiereDate,SortName sort_order=Ascending sort_label="najstaršie vydané"
+    extra+=("MinPremiereDate=1850-01-01")
+    ;;
+  name) sort_by=SortName sort_order=Ascending sort_label="podľa názvu" ;;
+  random)
+    sort_by=Random sort_order=Ascending sort_label="náhodný výber"
+    limit=50
+    ;;
+  long) sort_by=Runtime,SortName sort_order=Descending sort_label="najdlhšie" ;;
+  short) sort_by=Runtime,SortName sort_order=Ascending sort_label="najkratšie" ;;
+  *) return ;;
+  esac
+  parts+=("$sort_label")
+  label=$(printf '%s · ' "${parts[@]}")
+  label=${label% · }
+
+  items=$(BROWSE_LIMIT=$limit browse_items "$types" "$sort_by" "$sort_order" "${extra[@]}")
+  present_items "$items" asis "$limit" "$label"
+}
+
 while true; do
   if ((${#Q_ID[@]} == 0)); then hint="prázdne = koniec"; else hint="prázdne = ísť na sťahovanie"; fi
-  read -rp "Hľadaj [v košíku: ${#Q_ID[@]}] ($hint; s:text = len seriály, f:text = len filmy): " term
+  read -rp "Hľadaj [v košíku: ${#Q_ID[@]}] ($hint; b = prehliadať, s:text = len seriály, f:text = len filmy): " term
   if [[ -z $term ]]; then
     ((${#Q_ID[@]} == 0)) && break
     checkout
     reset_cart
+    continue
+  fi
+
+  if [[ $term == [bB] ]]; then
+    browse
     continue
   fi
 
@@ -672,37 +847,6 @@ while true; do
   [[ $what != series ]] && movie_json=$(search_items Movie "$term")
   # (through stdin: real responses are too big for a command-line argument)
   items=$(printf '%s\n%s\n' "$series_json" "$movie_json" | jq -s '{Items: (.[0].Items + .[1].Items)}')
-  n_series=$(jq '[.Items[] | select(.Type == "Series")] | length' <<<"$items")
-  n_movies=$(jq '[.Items[] | select(.Type == "Movie")] | length' <<<"$items")
-  note=""
-  if ((n_series >= SEARCH_LIMIT || n_movies >= SEARCH_LIMIT)); then
-    note=" (max. $SEARCH_LIMIT z každého druhu, spresni hľadanie)"
-  fi
 
-  list=$(jq -r --argjson lim "$(est_speed)" "$JQ_LIB"'
-    .Items | (map(select(.Type == "Series")) + map(select(.Type != "Series")))[] | [.Id,
-      (if .Type == "Series" then "seriál  " else "film    " end) + title
-        + (if .Type == "Movie" and (.MediaSources[0].Size // 0) > 0 then "  ·  " + (.MediaSources[0].Size | hb) else "" end),
-      .Type, .Name] | @tsv' <<<"$items" 2>/dev/null)
-
-  if [[ -z $list ]]; then
-    echo "Nič sa nenašlo."
-    continue
-  fi
-
-  make_previews "$items"
-
-  picked=$(fzf -m --delimiter=$'\t' --with-nth=2 --prompt="Pridať> " "${FZF_PREVIEW[@]}" \
-    --header="Seriály: $n_series · Filmy: $n_movies$note"$'\n'"Enter = pridať do košíka, Tab = označiť viac, Esc = späť" <<<"$list")
-  [[ -z $picked ]] && continue
-
-  movie_ids=""
-  while IFS=$'\t' read -r id _ type name; do
-    if [[ $type == Series ]]; then
-      series_menu "$id" "$name"
-    else
-      movie_ids+="$id"$'\n'
-    fi
-  done <<<"$picked"
-  [[ -n $movie_ids ]] && queue_add "$items" "$movie_ids"
+  present_items "$items" grouped "$SEARCH_LIMIT"
 done

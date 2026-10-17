@@ -9,6 +9,13 @@ hl.config({
     kb_layout = "us,sk",
     kb_variant = ",qwerty",
     kb_options = "grp:alt_shift_toggle",
+
+    touchpad = {
+      -- Keep the touchpad active right after typing (default disables it
+      -- briefly, which can eat a right-click in the corner zone if you
+      -- click right after typing).
+      disable_while_typing = false,
+    },
   },
 })
 

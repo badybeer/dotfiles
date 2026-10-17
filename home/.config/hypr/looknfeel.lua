@@ -43,3 +43,7 @@ hl.config({
 --     column_width = 0.97,
 --   },
 -- })
+
+-- Qt apps (qBittorrent, KGet, ...) use Kvantum, colored from the current Omarchy theme
+-- by ~/.config/omarchy/hooks/theme-set.d/qt-kvantum. Remove this line to go back to the default.
+hl.env("QT_QPA_PLATFORMTHEME", "qt6ct")

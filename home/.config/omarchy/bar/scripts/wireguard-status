@@ -1,6 +1,8 @@
 #!/bin/bash
+# The current monochrome theme draws "active" DIMMER (#a4a4a4) than normal bar text (#ffffff),
+# so the classes are swapped on purpose: VPN up = normal bright text, VPN down = dimmed.
 if ip link show wg0 &>/dev/null; then
-  echo '{"text":"VPN","tooltip":"WireGuard: pripojené (klik = odpojiť)","class":"active"}'
+  echo '{"text":"VPN","tooltip":"WireGuard: pripojené (klik = odpojiť)","class":"inactive"}'
 else
-  echo '{"text":"VPN","tooltip":"WireGuard: odpojené (klik = pripojiť)","class":"inactive"}'
+  echo '{"text":"VPN","tooltip":"WireGuard: odpojené (klik = pripojiť)","class":"active"}'
 fi

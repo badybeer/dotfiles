@@ -68,11 +68,19 @@
           "id": "omarchy.network"
         },
         {
+          "id": "notif-mute",
+          "type": "command",
+          "exec": "~/.config/omarchy/bar/scripts/notif-mute-status",
+          "onClick": "~/.local/bin/notif-mute-window",
+          "interval": 5,
+          "tooltip": "Notifikácie podľa apiek"
+        },
+        {
           "id": "wireguard",
           "type": "command",
           "exec": "~/.config/omarchy/bar/scripts/wireguard-status",
           "onClick": "~/.config/omarchy/bar/scripts/wireguard-toggle",
-          "interval": 3,
+          "interval": 1,
           "tooltip": "WireGuard VPN"
         },
         {
@@ -87,12 +95,25 @@
       ]
     },
     "position": "top",
-    "transparent": false
+    "transparent": true
   },
   "idle": {
     "lock": 300,
     "screensaver": 150
   },
-  "plugins": [],
-  "version": 1
+  "plugins": [
+    {
+      "id": "bady.notifications"
+    },
+    {
+      "id": "bady.chat-controls"
+    }
+  ],
+  "version": 1,
+  "disabledPlugins": [
+    "omarchy.notifications"
+  ],
+  "cloneSourceRestores": [
+    "bady.notifications"
+  ]
 }

@@ -7,4 +7,5 @@ SUPER + 0   workspace 10
 SUPER + ALT + 1-6   Telegram, Discord, Messenger, Instagram, WhatsApp, Teams
 SUPER + CTRL + ← →   previous / next
 SUPER + ALT + TAB   next
-SUPER + CTRL + ,   silence notifications (toggle)"
+SUPER + CTRL + ,   silence notifications (toggle)
+Bell in the bar   per-app popup and sound switches"

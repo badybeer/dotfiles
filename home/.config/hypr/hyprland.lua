@@ -35,6 +35,10 @@ o.window(
   { workspace = "10", group = "set", focus_on_activate = false }
 )
 
+-- Telegram's media viewer asks for fullscreen and the state sticks after it closes.
+-- Ignore the app's own fullscreen requests (SUPER + F still works).
+o.window("^org\\.telegram\\.desktop$", { suppress_event = "fullscreen" })
+
 -- emby-dl runs in a centered floating terminal.
 o.window("org.omarchy.emby-dl", { float = true })
 o.window("org.omarchy.emby-dl", { center = true })
@@ -44,3 +48,8 @@ o.window("org.omarchy.emby-dl", { size = { 1300, 760 } })
 o.window("org.omarchy.remote", { float = true })
 o.window("org.omarchy.remote", { center = true })
 o.window("org.omarchy.remote", { size = { 760, 320 } })
+
+-- notif-mute (per-app notification switches) is a small centered floating terminal.
+o.window("org.omarchy.notif-mute", { float = true })
+o.window("org.omarchy.notif-mute", { center = true })
+o.window("org.omarchy.notif-mute", { size = { 560, 340 } })

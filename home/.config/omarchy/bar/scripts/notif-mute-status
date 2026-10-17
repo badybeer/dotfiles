@@ -1,0 +1,8 @@
+#!/bin/bash
+
+muted=$(jq '[.apps[] | (select(.popup | not)), (select(.sound | not))] | length' ~/.config/omarchy/notif-mute.json 2>/dev/null)
+if [[ ${muted:-0} -gt 0 ]]; then
+  echo "{\"text\":\"󰂛 $muted\",\"tooltip\":\"Notifikácie: $muted stlmených (klik = nastavenia)\",\"class\":\"active\"}"
+else
+  echo '{"text":"󰂚","tooltip":"Notifikácie podľa apiek (klik = nastavenia)","class":"inactive"}'
+fi
